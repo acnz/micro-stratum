@@ -1,0 +1,21 @@
+menu "Micro-Stratum Configuration"
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default "MeuWiFi"
+        help
+            Nome da rede WiFi para conectar.
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default "minhasenha"
+        help
+            Senha da rede WiFi.
+
+    config BTC_ADDRESS
+        string "Bitcoin Wallet Address"
+        default "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+        help
+            Seu endereço de doação ou mineração.
+
+endmenu
