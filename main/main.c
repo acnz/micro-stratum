@@ -122,14 +122,19 @@ void calculate_target(double difficulty, uint8_t *target_out) {
     mbedtls_mpi diff1, pool_diff, result;
     mbedtls_mpi_init(&diff1); mbedtls_mpi_init(&pool_diff); mbedtls_mpi_init(&result);
     mbedtls_mpi_read_string(&diff1, 16, "00000000FFFF0000000000000000000000000000000000000000000000000000");
-    mbedtls_mpi_mul_int(&diff1, &diff1, 1000);
-    int diff_int = (int)(difficulty * 1000);
+    
+    // Multiplicamos por 1 MILHÃO para dar suporte a Dificuldades Fracionadas minúsculas!
+    mbedtls_mpi_mul_int(&diff1, &diff1, 1000000);
+    int diff_int = (int)(difficulty * 1000000);
+    
+    // Escudo contra divisão por zero caso a Pool mande um número maluco
+    if (diff_int <= 0) diff_int = 1; 
+    
     mbedtls_mpi_lset(&pool_diff, diff_int);
     mbedtls_mpi_div_mpi(&result, NULL, &diff1, &pool_diff);
     mbedtls_mpi_write_binary(&result, target_out, 32);
     mbedtls_mpi_free(&diff1); mbedtls_mpi_free(&pool_diff); mbedtls_mpi_free(&result);
 }
-
 void init_uart() {
     uart_config_t config = { .baud_rate = 115200, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT };
     uart_param_config(UART_PORT, &config);
@@ -277,8 +282,18 @@ static void stratum_client_task(void *pvParameters) {
         char auth[256]; snprintf(auth, 256, "{\"id\": 2, \"method\": \"mining.authorize\", \"params\": [\"%s.%s\", \"x\"]}\n", BTC_ADDRESS, WORKER_NAME);
         send(sock, auth, strlen(auth), 0);
 
+        // ---> ADICIONE ESTA PARTE AQUI <---
+        // A MÁGICA: Pedimos à Pool para baixar a régua para o nível NerdMiner!
+        char suggest[128];
+        snprintf(suggest, 128, "{\"id\": 3, \"method\": \"mining.suggest_difficulty\", \"params\": [0.00015]}\n");
+        send(sock, suggest, strlen(suggest), 0);
+        // ----------------------------------
+
         int rx_len = 0;
         memset(rx, 0, 4096);
+
+        // ---> 1. ADICIONAR ESTA VARIÁVEL AQUI (Antes do loop de escuta) <---
+        int64_t last_keepalive = esp_timer_get_time();
         
         while (1) {
             int len = recv(sock, rx + rx_len, 4096 - rx_len - 1, MSG_DONTWAIT);
@@ -342,6 +357,15 @@ static void stratum_client_task(void *pvParameters) {
                     g_shares_rejected++;
                 }
             }
+
+            if ((esp_timer_get_time() - last_keepalive) > 30000000) { // 30 segundos (30.000.000 microssegundos)
+                char keepalive_msg[128];
+                snprintf(keepalive_msg, sizeof(keepalive_msg), "{\"id\": 5, \"method\": \"mining.suggest_difficulty\", \"params\": [%.1f]}\n", g_pool_difficulty);
+                send(sock, keepalive_msg, strlen(keepalive_msg), 0);
+                last_keepalive = esp_timer_get_time();
+                ESP_LOGI(TAG, "💓 Ping (Keep-Alive) enviado à Pool para manter a ligação ativa!");
+            }
+
             vTaskDelay(10/portTICK_PERIOD_MS);
         }
         close(sock);
