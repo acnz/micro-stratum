@@ -25,8 +25,8 @@ menu "Micro-Stratum Configuration"
             Endereço da pool de mineração.
 
     config POOL_PORT
-        string "Pool port"
-        default "3333"
+        int "Pool port"
+        default 3333
         help
             Porta da pool de mineração.
 
@@ -35,5 +35,27 @@ menu "Micro-Stratum Configuration"
         default "MS-minis3"
         help
             Nome do worker na pool.
+
+    config UART_PORT_NUM
+        int "UART port number"
+        range 0 1
+        default 1
+        help
+            UART communication port number for the example.
+            See UART documentation for available port numbers.
+
+    config UART_RXD
+        int "UART RXD pin number"
+        default 5
+        help
+            GPIO number for UART RX pin. See UART documentation for more information
+            about available pin numbers for UART.
+
+    config UART_TXD
+        int "UART TXD pin number"
+        default 4
+        help
+            GPIO number for UART TX pin. See UART documentation for more information
+            about available pin numbers for UART.
 
 endmenu

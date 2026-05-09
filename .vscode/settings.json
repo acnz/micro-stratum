@@ -4,11 +4,11 @@
     "OPENOCD_SCRIPTS": "C:\\Users\\andre\\.espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20240318/openocd-esp32/share/openocd/scripts",
     "IDF_CCACHE_ENABLE": "1",
     "ESP_ROM_ELF_DIR": "C:\\Users\\andre\\.espressif\\tools\\esp-rom-elfs\\20240305/",
-    "IDF_TARGET": "esp32s3"
+    "IDF_TARGET": "esp32c3"
   },
   "idf.openOcdConfigs": [
-    "board/esp32s3-builtin.cfg"
+    "board/esp32c3-ftdi.cfg"
   ],
-  "idf.port": "/dev/ttyUSB0",
+  "idf.port": "/dev/ttyUSB1",
   "idf.flashType": "UART"
 }

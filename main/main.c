@@ -16,16 +16,18 @@
 #include "esp_http_server.h"
 #include "esp_timer.h"
 
-// --- CONFIGURAÇÕES ---
-#define TXD_PIN 17
-#define RXD_PIN 18
-#define UART_PORT UART_NUM_1
+// --- CONFIGURAÇÕES KCONFIG ---
+#define TXD_PIN CONFIG_UART_TXD
+#define RXD_PIN CONFIG_UART_RXD
+#define UART_PORT CONFIG_UART_PORT_NUM
+
+// Mapeando as variáveis dinâmicas do seu Menuconfig!
 #define WIFI_SSID CONFIG_WIFI_SSID
 #define WIFI_PASS CONFIG_WIFI_PASSWORD
 #define BTC_ADDRESS CONFIG_BTC_ADDRESS
-#define POOL_URL "pool.nerdminer.io"
-#define POOL_PORT 3333
-#define WORKER_NAME "MS-minis3"
+#define POOL_URL CONFIG_POOL_URL
+#define POOL_PORT CONFIG_POOL_PORT
+#define WORKER_NAME CONFIG_WORKER_NAME
 
 static const char *TAG = "MICRO_STRATUM";
 
@@ -102,7 +104,6 @@ uint8_t get_crc5(uint8_t *ptr, uint8_t len) {
     return ((crc >> 3) & 0x1f);
 }
 
-// Novo Conversor Hexadecimal (1000x mais rápido que o sscanf antigo)
 void hex_to_bytes(const char *hex, uint8_t *bytes) {
     size_t len = strlen(hex);
     for (size_t i = 0; i < len / 2; i++) {
@@ -140,14 +141,15 @@ void init_uart() {
 // WEB SERVER DASHBOARD
 // ============================================================================
 esp_err_t stats_get_handler(httpd_req_t *req) {
-    char *buf;
-    size_t buf_len = 4096; // Buffer enorme garantido
+    size_t buf_len = 4096;
+    char *buf = calloc(buf_len, 1);
+    if (!buf) return ESP_FAIL;
+    
     uint32_t uptime_sec = (uint32_t)((esp_timer_get_time() - g_start_time) / 1000000);
     
     double hashrate = 0;
     if (uptime_sec > 0) hashrate = (double)g_shares_accepted * g_pool_difficulty * 4294967296.0 / uptime_sec;
 
-    buf = malloc(buf_len);
     char history_html[2048] = "";
     for(int i=0; i<10; i++) {
         if(strlen(g_last_accepted_times[i]) > 0) {
@@ -164,6 +166,7 @@ esp_err_t stats_get_handler(httpd_req_t *req) {
         "<title>ESP-Miner Dashboard</title></head><body><div class='card'>"
         "<h1>⛏️ Micro-Stratum</h1>"
         "<div class='stat'>Status: <span class='val' style='color:#4caf50;'>MINERANDO</span></div>"
+        "<div class='stat'>Pool: <span class='val'>%s:%d</span></div>"
         "<div class='stat'>Hashrate Est.: <span class='val'>%.2f H/s</span></div>"
         "<div class='stat'>Total Shares: <span class='val'>%lu</span></div>"
         "<div class='stat'>Aceitos: <span class='val' style='color:#4caf50;'>%lu</span></div>"
@@ -172,7 +175,7 @@ esp_err_t stats_get_handler(httpd_req_t *req) {
         "<div class='stat'>Dificuldade: <span class='val'>%.1f</span></div>"
         "<h3>🕒 Últimos Shares Aceitos:</h3><ul>%s</ul>"
         "</div></body></html>",
-        hashrate, (unsigned long)(g_shares_accepted + g_shares_rejected), (unsigned long)g_shares_accepted, 
+        POOL_URL, POOL_PORT, hashrate, (unsigned long)(g_shares_accepted + g_shares_rejected), (unsigned long)g_shares_accepted, 
         (unsigned long)g_shares_rejected, (unsigned long)uptime_sec, g_pool_difficulty, history_html
     );
 
@@ -185,7 +188,7 @@ esp_err_t stats_get_handler(httpd_req_t *req) {
 void start_webserver() {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 8192;
+    config.stack_size = 12288;
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t stats_uri = { .uri = "/", .method = HTTP_GET, .handler = stats_get_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &stats_uri);
@@ -196,7 +199,6 @@ void start_webserver() {
 // STRATUM PARSER & CLIENT
 // ============================================================================
 void process_mining_notify(cJSON *params) {
-    // Escudo de proteção de memória
     if (!params || !cJSON_IsArray(params) || cJSON_GetArraySize(params) < 8) return;
 
     cJSON *j_job = cJSON_GetArrayItem(params, 0); cJSON *j_prev = cJSON_GetArrayItem(params, 1);
@@ -206,13 +208,23 @@ void process_mining_notify(cJSON *params) {
 
     if (!cJSON_IsString(j_job) || !cJSON_IsString(j_prev) || !cJSON_IsString(j_cb1) || !cJSON_IsString(j_cb2) || !cJSON_IsArray(j_merkle)) return;
 
+    char *coinbase_hex = calloc(2048, 1);
+    uint8_t *coinbase_bin = calloc(1024, 1);
+    if (!coinbase_hex || !coinbase_bin) {
+        if(coinbase_hex) free(coinbase_hex);
+        if(coinbase_bin) free(coinbase_bin);
+        return;
+    }
+
     uint8_t current_hash[32];
-    char coinbase_hex[1024] = "";
     strcat(coinbase_hex, j_cb1->valuestring); strcat(coinbase_hex, g_extranonce1); 
     strcat(coinbase_hex, "00000000"); strcat(coinbase_hex, j_cb2->valuestring);
     
-    uint8_t coinbase_bin[512]; hex_to_bytes(coinbase_hex, coinbase_bin);
+    hex_to_bytes(coinbase_hex, coinbase_bin);
     double_sha256(coinbase_bin, strlen(coinbase_hex)/2, current_hash);
+    
+    free(coinbase_hex);
+    free(coinbase_bin);
 
     for (int i = 0; i < cJSON_GetArraySize(j_merkle); i++) {
         uint8_t branch_bin[32], combined[64];
@@ -246,6 +258,9 @@ void process_mining_notify(cJSON *params) {
 }
 
 static void stratum_client_task(void *pvParameters) {
+    char *rx = calloc(4096, 1);
+    if(!rx) { ESP_LOGE(TAG, "Falha crítica de RAM."); vTaskDelete(NULL); }
+
     while (1) {
         struct hostent *hp = gethostbyname(POOL_URL);
         if (!hp) { vTaskDelay(2000 / portTICK_PERIOD_MS); continue; }
@@ -262,15 +277,15 @@ static void stratum_client_task(void *pvParameters) {
         char auth[256]; snprintf(auth, 256, "{\"id\": 2, \"method\": \"mining.authorize\", \"params\": [\"%s.%s\", \"x\"]}\n", BTC_ADDRESS, WORKER_NAME);
         send(sock, auth, strlen(auth), 0);
 
-        char rx[4096]; int rx_len = 0;
+        int rx_len = 0;
+        memset(rx, 0, 4096);
         
         while (1) {
             int len = recv(sock, rx + rx_len, 4096 - rx_len - 1, MSG_DONTWAIT);
             
-            // O FIM DO MISTÉRIO: Tratamento severo se a Pool fechar a conexão!
             if (len == 0) {
                 ESP_LOGE(TAG, "💀 Conexão morta pela Pool! Reconectando...");
-                break; // Quebra o loop interno e força reconexão TCP
+                break; 
             } 
             else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != 11) {
                 ESP_LOGE(TAG, "⚠️ Erro de rede (errno %d)! Reconectando...", errno);
@@ -301,7 +316,6 @@ static void stratum_client_task(void *pvParameters) {
                     if (rem > 0) memmove(rx, nl + 1, rem);
                     rx_len = rem; rx[rx_len] = '\0';
                 }
-                // Previne Buffer Overflow em caso de lixo sem quebra de linha
                 if (rx_len > 4000) rx_len = 0; 
             }
 
@@ -370,5 +384,5 @@ void app_main(void) {
 
     vTaskDelay(5000 / portTICK_PERIOD_MS);
     start_webserver(); 
-    xTaskCreate(stratum_client_task, "stratum_task", 8192, NULL, 5, NULL);
+    xTaskCreate(stratum_client_task, "stratum_task", 20480, NULL, 5, NULL);
 }
