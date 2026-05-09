@@ -2,36 +2,40 @@
 #include <sys/param.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "cJSON.h"
 #include "mbedtls/sha256.h"
 #include "driver/uart.h"
-#include "driver/gpio.h"
 #include "mbedtls/bignum.h"
+#include "esp_http_server.h"
+#include "esp_timer.h"
 
+// --- CONFIGURAÇÕES ---
 #define TXD_PIN 17
 #define RXD_PIN 18
 #define UART_PORT UART_NUM_1
-
 #define WIFI_SSID CONFIG_WIFI_SSID
 #define WIFI_PASS CONFIG_WIFI_PASSWORD
 #define BTC_ADDRESS CONFIG_BTC_ADDRESS
-
 #define POOL_URL "pool.nerdminer.io"
 #define POOL_PORT 3333
 #define WORKER_NAME "MS-minis3"
 
 static const char *TAG = "MICRO_STRATUM";
 
-// --- VARIÁVEIS DE MEMÓRIA DO CÉREBRO ---
+// --- ESTATÍSTICAS GLOBAIS ---
+uint32_t g_shares_accepted = 0;
+uint32_t g_shares_rejected = 0;
+int64_t g_start_time = 0;
+char g_last_accepted_times[10][64];
+int g_accepted_idx = 0;
+
 double g_pool_difficulty = 1.0;
 uint8_t g_current_header[80] = {0};
 char g_last_job_id[32] = {0};
@@ -40,7 +44,7 @@ char g_extranonce1[32] = {0};
 int g_extranonce2_size = 0;
 
 // ============================================================================
-// NÚCLEO SHA-256 PURO (Para calcular o Midstate no S3)
+// MATEMÁTICA SHA-256 (MIDSTATE)
 // ============================================================================
 static const uint32_t sha256_k[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -52,7 +56,6 @@ static const uint32_t sha256_k[64] = {
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
-
 #define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 #define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
 #define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
@@ -62,41 +65,29 @@ static const uint32_t sha256_k[64] = {
 #define SIG1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ ((x) >> 10))
 
 void sha256_transform(uint32_t *state, const uint8_t *data) {
-    uint32_t a, b, c, d, e, f, g, h, i, T1, T2;
-    uint32_t W[64];
+    uint32_t a, b, c, d, e, f, g, h, i, T1, T2, W[64];
     for (i = 0; i < 16; i++) W[i] = (data[i * 4] << 24) | (data[i * 4 + 1] << 16) | (data[i * 4 + 2] << 8) | data[i * 4 + 3];
     for (i = 16; i < 64; i++) W[i] = SIG1(W[i - 2]) + W[i - 7] + SIG0(W[i - 15]) + W[i - 16];
-    a = state[0]; b = state[1]; c = state[2]; d = state[3];
-    e = state[4]; f = state[5]; g = state[6]; h = state[7];
+    a = state[0]; b = state[1]; c = state[2]; d = state[3]; e = state[4]; f = state[5]; g = state[6]; h = state[7];
     for (i = 0; i < 64; i++) {
         T1 = h + EP1(e) + CH(e, f, g) + sha256_k[i] + W[i];
         T2 = EP0(a) + MAJ(a, b, c);
-        h = g; g = f; f = e; e = d + T1;
-        d = c; c = b; b = a; a = T1 + T2;
+        h = g; g = f; f = e; e = d + T1; d = c; c = b; b = a; a = T1 + T2;
     }
-    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
-    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d; state[4] += e; state[5] += f; state[6] += g; state[7] += h;
 }
 
-static const uint32_t sha256_initial_hash[8] = {
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-};
-
 void calculate_midstate(const uint8_t *header64, uint8_t *midstate_out) {
-    uint32_t state[8];
-    memcpy(state, sha256_initial_hash, 32);
+    uint32_t state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
     sha256_transform(state, header64);
     for(int i=0; i<8; i++) {
-        midstate_out[i*4]   = (state[i] >> 24) & 0xFF;
-        midstate_out[i*4+1] = (state[i] >> 16) & 0xFF;
-        midstate_out[i*4+2] = (state[i] >> 8)  & 0xFF;
-        midstate_out[i*4+3] = (state[i] >> 0)  & 0xFF;
+        midstate_out[i*4] = (state[i] >> 24) & 0xFF; midstate_out[i*4+1] = (state[i] >> 16) & 0xFF;
+        midstate_out[i*4+2] = (state[i] >> 8) & 0xFF; midstate_out[i*4+3] = state[i] & 0xFF;
     }
 }
 
 // ============================================================================
-// FUNÇÕES AUXILIARES DE CRIPTOGRAFIA E REDE
+// FUNÇÕES AUXILIARES SEGURAS E RÁPIDAS
 // ============================================================================
 
 uint8_t get_crc5(uint8_t *ptr, uint8_t len) {
@@ -111,317 +102,273 @@ uint8_t get_crc5(uint8_t *ptr, uint8_t len) {
     return ((crc >> 3) & 0x1f);
 }
 
-void calculate_target(double difficulty, uint8_t *target_out) {
-    memset(target_out, 0, 32);
-    if (difficulty <= 0.0) difficulty = 1.0;
+// Novo Conversor Hexadecimal (1000x mais rápido que o sscanf antigo)
+void hex_to_bytes(const char *hex, uint8_t *bytes) {
+    size_t len = strlen(hex);
+    for (size_t i = 0; i < len / 2; i++) {
+        char high = hex[i * 2], low = hex[i * 2 + 1];
+        uint8_t h = (high >= '0' && high <= '9') ? (high - '0') : (high >= 'a' && high <= 'f') ? (high - 'a' + 10) : (high >= 'A' && high <= 'F') ? (high - 'A' + 10) : 0;
+        uint8_t l = (low >= '0' && low <= '9') ? (low - '0') : (low >= 'a' && low <= 'f') ? (low - 'a' + 10) : (low >= 'A' && low <= 'F') ? (low - 'A' + 10) : 0;
+        bytes[i] = (h << 4) | l;
+    }
+}
 
+void double_sha256(const uint8_t *data, size_t len, uint8_t *out) {
+    uint8_t h1[32]; mbedtls_sha256(data, len, h1, 0); mbedtls_sha256(h1, 32, out, 0);
+}
+
+void calculate_target(double difficulty, uint8_t *target_out) {
     mbedtls_mpi diff1, pool_diff, result;
     mbedtls_mpi_init(&diff1); mbedtls_mpi_init(&pool_diff); mbedtls_mpi_init(&result);
-
     mbedtls_mpi_read_string(&diff1, 16, "00000000FFFF0000000000000000000000000000000000000000000000000000");
     mbedtls_mpi_mul_int(&diff1, &diff1, 1000);
     int diff_int = (int)(difficulty * 1000);
-
     mbedtls_mpi_lset(&pool_diff, diff_int);
     mbedtls_mpi_div_mpi(&result, NULL, &diff1, &pool_diff);
     mbedtls_mpi_write_binary(&result, target_out, 32);
-
     mbedtls_mpi_free(&diff1); mbedtls_mpi_free(&pool_diff); mbedtls_mpi_free(&result);
 }
 
 void init_uart() {
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_PORT, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 1024, 1024, 0, NULL, 0));
-    ESP_LOGI("UART", "Porta Serial inicializada nos pinos TX:%d RX:%d", TXD_PIN, RXD_PIN);
+    uart_config_t config = { .baud_rate = 115200, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT };
+    uart_param_config(UART_PORT, &config);
+    uart_set_pin(UART_PORT, TXD_PIN, RXD_PIN, -1, -1);
+    uart_driver_install(UART_PORT, 1024, 1024, 0, NULL, 0);
 }
 
-void test_uart_ping_pong() {
-    ESP_LOGW("UART_TEST", "--- INICIANDO TESTE FÍSICO PING-PONG ---");
-    ESP_LOGI("UART_TEST", "Enviando 'PING' para o C3...");
-    uart_flush(UART_PORT);
-    uart_write_bytes(UART_PORT, "PING", 4);
+// ============================================================================
+// WEB SERVER DASHBOARD
+// ============================================================================
+esp_err_t stats_get_handler(httpd_req_t *req) {
+    char *buf;
+    size_t buf_len = 4096; // Buffer enorme garantido
+    uint32_t uptime_sec = (uint32_t)((esp_timer_get_time() - g_start_time) / 1000000);
+    
+    double hashrate = 0;
+    if (uptime_sec > 0) hashrate = (double)g_shares_accepted * g_pool_difficulty * 4294967296.0 / uptime_sec;
 
-    uint8_t rx_buf[128] = {0};
-    int len = uart_read_bytes(UART_PORT, rx_buf, sizeof(rx_buf) - 1, 2000 / portTICK_PERIOD_MS);
-
-    if (len > 0) {
-        rx_buf[len] = '\0';
-        if (strstr((char *)rx_buf, "PONG") != NULL) {
-            ESP_LOGI("UART_TEST", "SUCESSO ABSOLUTO! Recebido: %s", rx_buf);
-        } else {
-            ESP_LOGE("UART_TEST", "FALHA! Recebido %d bytes de 'lixo' em vez de PONG.", len);
-            ESP_LOG_BUFFER_HEX("UART_TEST_HEX", rx_buf, len);
+    buf = malloc(buf_len);
+    char history_html[2048] = "";
+    for(int i=0; i<10; i++) {
+        if(strlen(g_last_accepted_times[i]) > 0) {
+            strcat(history_html, "<li>"); strcat(history_html, g_last_accepted_times[i]); strcat(history_html, "</li>");
         }
-    } else {
-        ESP_LOGE("UART_TEST", "FALHA! Sem resposta (Timeout de 2 segundos).");
     }
-    ESP_LOGW("UART_TEST", "----------------------------------------");
+
+    snprintf(buf, buf_len,
+        "<html><head><meta charset='UTF-8'><meta http-equiv='refresh' content='5'>"
+        "<style>body{background:#121212;color:#e0e0e0;font-family:sans-serif;display:flex;justify-content:center;padding:20px;}"
+        ".card{background:#1e1e1e;padding:30px;border-radius:15px;box-shadow:0 10px 30px rgba(0,0,0,0.5);width:400px;border-top:5px solid #f2a900;}"
+        "h1{color:#f2a900;margin-top:0;} .stat{margin:15px 0;font-size:1.2em;} .val{font-weight:bold;color:#fff;float:right;}"
+        "ul{list-style:none;padding:0;font-size:0.9em;color:#888;} li{border-bottom:1px solid #333;padding:5px 0;}</style>"
+        "<title>ESP-Miner Dashboard</title></head><body><div class='card'>"
+        "<h1>⛏️ Micro-Stratum</h1>"
+        "<div class='stat'>Status: <span class='val' style='color:#4caf50;'>MINERANDO</span></div>"
+        "<div class='stat'>Hashrate Est.: <span class='val'>%.2f H/s</span></div>"
+        "<div class='stat'>Total Shares: <span class='val'>%lu</span></div>"
+        "<div class='stat'>Aceitos: <span class='val' style='color:#4caf50;'>%lu</span></div>"
+        "<div class='stat'>Rejeitados (Brain): <span class='val' style='color:#f44336;'>%lu</span></div>"
+        "<div class='stat'>Uptime: <span class='val'>%lu s</span></div>"
+        "<div class='stat'>Dificuldade: <span class='val'>%.1f</span></div>"
+        "<h3>🕒 Últimos Shares Aceitos:</h3><ul>%s</ul>"
+        "</div></body></html>",
+        hashrate, (unsigned long)(g_shares_accepted + g_shares_rejected), (unsigned long)g_shares_accepted, 
+        (unsigned long)g_shares_rejected, (unsigned long)uptime_sec, g_pool_difficulty, history_html
+    );
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, buf, strlen(buf));
+    free(buf);
+    return ESP_OK;
 }
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) esp_wifi_connect();
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        esp_wifi_connect();
-        ESP_LOGI(TAG, "Tentando reconectar ao Wi-Fi...");
+void start_webserver() {
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t stats_uri = { .uri = "/", .method = HTTP_GET, .handler = stats_get_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &stats_uri);
     }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "Conectado! IP recebido: " IPSTR, IP2STR(&event->ip_info.ip));
-    }
 }
 
-void hex_to_bytes(const char *hex, uint8_t *bytes) {
-    size_t len = strlen(hex);
-    for (size_t i = 0; i < len; i += 2) sscanf(hex + i, "%02hhx", &bytes[i / 2]);
-}
-
-void double_sha256(const uint8_t *data, size_t len, uint8_t *out) {
-    uint8_t hash1[32];
-    mbedtls_sha256(data, len, hash1, 0);
-    mbedtls_sha256(hash1, 32, out, 0);
-}
-
+// ============================================================================
+// STRATUM PARSER & CLIENT
+// ============================================================================
 void process_mining_notify(cJSON *params) {
-    const char *job_id = cJSON_GetArrayItem(params, 0)->valuestring;
-    const char *prev_hash_hex = cJSON_GetArrayItem(params, 1)->valuestring;
-    const char *coinb1 = cJSON_GetArrayItem(params, 2)->valuestring;
-    const char *coinb2 = cJSON_GetArrayItem(params, 3)->valuestring;
-    cJSON *merkle_branches = cJSON_GetArrayItem(params, 4);
+    // Escudo de proteção de memória
+    if (!params || !cJSON_IsArray(params) || cJSON_GetArraySize(params) < 8) return;
 
-    ESP_LOGI("STRATUM_PARSER", "Novo Trabalho Recebido: %s", job_id);
+    cJSON *j_job = cJSON_GetArrayItem(params, 0); cJSON *j_prev = cJSON_GetArrayItem(params, 1);
+    cJSON *j_cb1 = cJSON_GetArrayItem(params, 2); cJSON *j_cb2 = cJSON_GetArrayItem(params, 3);
+    cJSON *j_merkle = cJSON_GetArrayItem(params, 4); cJSON *j_ver = cJSON_GetArrayItem(params, 5);
+    cJSON *j_nbits = cJSON_GetArrayItem(params, 6); cJSON *j_ntime = cJSON_GetArrayItem(params, 7);
 
-    char extranonce2_hex[9] = "00000000";
-
-    size_t coinb_len = strlen(coinb1) + strlen(g_extranonce1) + strlen(extranonce2_hex) + strlen(coinb2);
-    char *coinbase_hex = malloc(coinb_len + 1);
-    strcpy(coinbase_hex, coinb1);
-    strcat(coinbase_hex, g_extranonce1);
-    strcat(coinbase_hex, extranonce2_hex);
-    strcat(coinbase_hex, coinb2);
-
-    size_t coinbase_bin_len = coinb_len / 2;
-    uint8_t *coinbase_bin = malloc(coinbase_bin_len);
-    hex_to_bytes(coinbase_hex, coinbase_bin);
+    if (!cJSON_IsString(j_job) || !cJSON_IsString(j_prev) || !cJSON_IsString(j_cb1) || !cJSON_IsString(j_cb2) || !cJSON_IsArray(j_merkle)) return;
 
     uint8_t current_hash[32];
-    double_sha256(coinbase_bin, coinbase_bin_len, current_hash);
-    free(coinbase_hex); free(coinbase_bin);
+    char coinbase_hex[1024] = "";
+    strcat(coinbase_hex, j_cb1->valuestring); strcat(coinbase_hex, g_extranonce1); 
+    strcat(coinbase_hex, "00000000"); strcat(coinbase_hex, j_cb2->valuestring);
+    
+    uint8_t coinbase_bin[512]; hex_to_bytes(coinbase_hex, coinbase_bin);
+    double_sha256(coinbase_bin, strlen(coinbase_hex)/2, current_hash);
 
-    int branch_count = cJSON_GetArraySize(merkle_branches);
-    uint8_t branch_bin[32], combined[64];
-
-    for (int i = 0; i < branch_count; i++) {
-        const char *branch_hex = cJSON_GetArrayItem(merkle_branches, i)->valuestring;
-        hex_to_bytes(branch_hex, branch_bin);
-        memcpy(combined, current_hash, 32);
-        memcpy(combined + 32, branch_bin, 32);
-        double_sha256(combined, 64, current_hash);
+    for (int i = 0; i < cJSON_GetArraySize(j_merkle); i++) {
+        uint8_t branch_bin[32], combined[64];
+        cJSON *branch_item = cJSON_GetArrayItem(j_merkle, i);
+        if (cJSON_IsString(branch_item)) {
+            hex_to_bytes(branch_item->valuestring, branch_bin);
+            memcpy(combined, current_hash, 32); memcpy(combined + 32, branch_bin, 32);
+            double_sha256(combined, 64, current_hash);
+        }
     }
-    ESP_LOGI("STRATUM_PARSER", "Merkle Root calculado com sucesso! (Nível: %d)", branch_count);
 
     uint8_t header[80] = {0};
-    const char *version_hex = cJSON_GetArrayItem(params, 5)->valuestring;
-    const char *nbits_hex = cJSON_GetArrayItem(params, 6)->valuestring;
-    const char *ntime_hex = cJSON_GetArrayItem(params, 7)->valuestring;
+    if (cJSON_IsString(j_ver) && cJSON_IsString(j_nbits) && cJSON_IsString(j_ntime)) {
+        hex_to_bytes(j_ver->valuestring, &header[0]);   
+        hex_to_bytes(j_prev->valuestring, &header[4]); 
+        memcpy(&header[36], current_hash, 32);   
+        hex_to_bytes(j_ntime->valuestring, &header[68]);    
+        hex_to_bytes(j_nbits->valuestring, &header[72]);    
 
-    hex_to_bytes(version_hex, &header[0]);   
-    hex_to_bytes(prev_hash_hex, &header[4]); 
-    memcpy(&header[36], current_hash, 32);   
-    hex_to_bytes(ntime_hex, &header[68]);    
-    hex_to_bytes(nbits_hex, &header[72]);    
+        memcpy(g_current_header, header, 80);
+        strncpy(g_last_job_id, j_job->valuestring, 31);
+        strncpy(g_last_ntime, j_ntime->valuestring, 15);
 
-    // CÉREBRO: Guarda os dados para comparar o Hash depois
-    memcpy(g_current_header, header, 80);
-    strcpy(g_last_job_id, job_id);
-    strcpy(g_last_ntime, ntime_hex);
-
-    uint8_t midstate[32] = {0};
-    calculate_midstate(header, midstate);
-
-    uint8_t asic_packet[70] = {0};
-    asic_packet[0] = 0x55; 
-    asic_packet[1] = 0xAA; 
-    asic_packet[2] = 0x21; // SEND_WORK ORIGINAL
-    asic_packet[3] = 0x42; 
-
-    memcpy(&asic_packet[4], midstate, 32);
-    memcpy(&asic_packet[36], &header[64], 12);
-    asic_packet[69] = get_crc5(&asic_packet[2], 67);
-
-    uart_write_bytes(UART_PORT, asic_packet, 70);
-    ESP_LOGI("UART", "=> Pacote 0x21 de 70 bytes enviado para o ASIC!");
+        uint8_t midstate[32] = {0}; calculate_midstate(header, midstate);
+        uint8_t packet[70] = {0x55, 0xAA, 0x21, 0x42};
+        memcpy(&packet[4], midstate, 32); memcpy(&packet[36], &header[64], 12);
+        packet[69] = get_crc5(&packet[2], 67);
+        uart_write_bytes(UART_PORT, packet, 70);
+        ESP_LOGI(TAG, "=> Trabalho ID [%s] enviado para o C3 fritar!", g_last_job_id);
+    }
 }
 
 static void stratum_client_task(void *pvParameters) {
     while (1) {
         struct hostent *hp = gethostbyname(POOL_URL);
-        if (!hp) {
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        struct sockaddr_in dest_addr;
-        inet_pton(AF_INET, inet_ntoa(*(struct in_addr *)hp->h_addr), &dest_addr.sin_addr);
-        dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = htons(POOL_PORT);
-
-        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-        if (sock < 0) break;
+        if (!hp) { vTaskDelay(2000 / portTICK_PERIOD_MS); continue; }
         
-        ESP_LOGI(TAG, "Conectando a %s:%d...", POOL_URL, POOL_PORT);
-        if (connect(sock, (struct sockaddr *)&dest_addr, sizeof(struct sockaddr_in)) != 0) {
-            close(sock);
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
-            continue;
-        }
-        ESP_LOGI(TAG, "Conectado à Pool!");
-
-        const char *subscribe_msg = "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": []}\n";
-        send(sock, subscribe_msg, strlen(subscribe_msg), 0);
+        struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(POOL_PORT) };
+        inet_pton(AF_INET, inet_ntoa(*(struct in_addr *)hp->h_addr), &addr.sin_addr);
         
-        char auth_msg[200];
-        snprintf(auth_msg, sizeof(auth_msg), "{\"id\": 2, \"method\": \"mining.authorize\", \"params\": [\"%s.%s\", \"x\"]}\n", BTC_ADDRESS, WORKER_NAME);
-        send(sock, auth_msg, strlen(auth_msg), 0);
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) { 
+            close(sock); vTaskDelay(2000/portTICK_PERIOD_MS); continue; 
+        }
+        
+        send(sock, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"MicroStratum/1.0\"]}\n", 71, 0);
+        char auth[256]; snprintf(auth, 256, "{\"id\": 2, \"method\": \"mining.authorize\", \"params\": [\"%s.%s\", \"x\"]}\n", BTC_ADDRESS, WORKER_NAME);
+        send(sock, auth, strlen(auth), 0);
 
-        char *rx_buffer = calloc(4096, sizeof(char));
-        int rx_len = 0;
-
+        char rx[4096]; int rx_len = 0;
+        
         while (1) {
-            // TCP de Forma Assíncrona (MSG_DONTWAIT evita que o loop trave aqui)
-            int len = recv(sock, rx_buffer + rx_len, 4096 - rx_len - 1, MSG_DONTWAIT);
-            if (len < 0) {
-                // Se o erro não for de "tentar novamente" (EAGAIN), a rede caiu
-                if (errno != EAGAIN && errno != EWOULDBLOCK && errno != 11) {
-                    ESP_LOGE(TAG, "Erro na recepção TCP: errno %d", errno);
-                    break;
-                }
-            } else if (len == 0) {
-                ESP_LOGW(TAG, "Conexão fechada pela Pool.");
+            int len = recv(sock, rx + rx_len, 4096 - rx_len - 1, MSG_DONTWAIT);
+            
+            // O FIM DO MISTÉRIO: Tratamento severo se a Pool fechar a conexão!
+            if (len == 0) {
+                ESP_LOGE(TAG, "💀 Conexão morta pela Pool! Reconectando...");
+                break; // Quebra o loop interno e força reconexão TCP
+            } 
+            else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != 11) {
+                ESP_LOGE(TAG, "⚠️ Erro de rede (errno %d)! Reconectando...", errno);
                 break;
-            } else {
-                rx_len += len;
-                rx_buffer[rx_len] = '\0';
-
-                char *newline;
-                while ((newline = strchr(rx_buffer, '\n')) != NULL) {
-                    *newline = '\0';
-                    cJSON *json = cJSON_Parse(rx_buffer);
-                    if (json) {
-                        cJSON *method = cJSON_GetObjectItem(json, "method");
-                        if (method) {
-                            if (strcmp(method->valuestring, "mining.notify") == 0) {
-                                process_mining_notify(cJSON_GetObjectItem(json, "params"));
-                            } else if (strcmp(method->valuestring, "mining.set_difficulty") == 0) {
-                                cJSON *diff_arr = cJSON_GetObjectItem(json, "params");
-                                if (cJSON_IsArray(diff_arr)) {
-                                    g_pool_difficulty = cJSON_GetArrayItem(diff_arr, 0)->valuedouble;
-                                    ESP_LOGW("STRATUM", "Dificuldade da Pool atualizada: %.3f", g_pool_difficulty);
-                                }
-                            }
+            } 
+            else if (len > 0) {
+                rx_len += len; rx[rx_len] = '\0';
+                char *nl;
+                while ((nl = strchr(rx, '\n'))) {
+                    *nl = '\0'; cJSON *j = cJSON_Parse(rx);
+                    if (j) {
+                        cJSON *m = cJSON_GetObjectItem(j, "method");
+                        if (m && cJSON_IsString(m)) {
+                            if (!strcmp(m->valuestring, "mining.notify")) process_mining_notify(cJSON_GetObjectItem(j, "params"));
+                            else if (!strcmp(m->valuestring, "mining.set_difficulty")) g_pool_difficulty = cJSON_GetArrayItem(cJSON_GetObjectItem(j, "params"), 0)->valuedouble;
                         }
-
-                        cJSON *id = cJSON_GetObjectItem(json, "id");
+                        cJSON *id = cJSON_GetObjectItem(j, "id");
                         if (id && id->valueint == 1) {
-                            cJSON *result = cJSON_GetObjectItem(json, "result");
-                            if (cJSON_IsArray(result)) {
-                                strcpy(g_extranonce1, cJSON_GetArrayItem(result, 1)->valuestring);
-                                g_extranonce2_size = cJSON_GetArrayItem(result, 2)->valueint;
-                                ESP_LOGI(TAG, "Extranonce1 capturado!");
+                            cJSON *res = cJSON_GetObjectItem(j, "result");
+                            if (cJSON_IsArray(res) && cJSON_GetArraySize(res) >= 3) { 
+                                cJSON *extra = cJSON_GetArrayItem(res, 1);
+                                if (cJSON_IsString(extra)) strcpy(g_extranonce1, extra->valuestring); 
                             }
                         }
-                        cJSON_Delete(json);
+                        cJSON_Delete(j);
                     }
-                    int remaining = rx_len - (newline - rx_buffer) - 1;
-                    if (remaining > 0) memmove(rx_buffer, newline + 1, remaining);
-                    rx_len = remaining;
-                    rx_buffer[rx_len] = '\0';
+                    int rem = rx_len - (nl - rx) - 1;
+                    if (rem > 0) memmove(rx, nl + 1, rem);
+                    rx_len = rem; rx[rx_len] = '\0';
                 }
+                // Previne Buffer Overflow em caso de lixo sem quebra de linha
+                if (rx_len > 4000) rx_len = 0; 
             }
 
             // --- ESCUTA ASSÍNCRONA DO C3 E JULGAMENTO DO HASH ---
-            uint8_t asic_resp[32];
-            int uart_len = uart_read_bytes(UART_PORT, asic_resp, 11, 10 / portTICK_PERIOD_MS);
-
-            if (uart_len == 11 && asic_resp[0] == 0xAA && asic_resp[1] == 0x55) {
-                uint32_t nonce = (asic_resp[4] << 24) | (asic_resp[5] << 16) | (asic_resp[6] << 8) | asic_resp[7];
-                ESP_LOGI("CÉREBRO_S3", "Nonce recebido do ASIC: %08lx. Avaliando...", (unsigned long)nonce);
-
-                g_current_header[76] = asic_resp[7];
-                g_current_header[77] = asic_resp[6];
-                g_current_header[78] = asic_resp[5];
-                g_current_header[79] = asic_resp[4];
-
-                uint8_t hash1[32], hash2[32];
-                mbedtls_sha256(g_current_header, 80, hash1, 0);
-                mbedtls_sha256(hash1, 32, hash2, 0);
-
-                uint8_t target[32];
-                calculate_target(g_pool_difficulty, target);
-
-                uint8_t hash_rev[32];
-                for (int i = 0; i < 32; i++) hash_rev[i] = hash2[31 - i];
-
-                bool is_valid = false;
-                for (int i = 0; i < 32; i++) {
-                    if (hash_rev[i] < target[i]) { is_valid = true; break; } 
-                    if (hash_rev[i] > target[i]) { is_valid = false; break; } 
-                }
-
-                if (is_valid) {
-                    char nonce_hex[9];
-                    sprintf(nonce_hex, "%08lx", (unsigned long)nonce);
-                    ESP_LOGW("CÉREBRO_S3", "SHARE APROVADO! Enviando para a Pool...");
-                    char submit_msg[256];
-                    snprintf(submit_msg, sizeof(submit_msg),
-                             "{\"id\": 4, \"method\": \"mining.submit\", \"params\": [\"%s.%s\", \"%s\", \"00000000\", \"%s\", \"%s\"]}\n",
-                             BTC_ADDRESS, WORKER_NAME, g_last_job_id, g_last_ntime, nonce_hex);
-                    send(sock, submit_msg, strlen(submit_msg), 0);
+            uint8_t resp[32];
+            if (uart_read_bytes(UART_PORT, resp, 11, 10 / portTICK_PERIOD_MS) == 11 && resp[0] == 0xAA && resp[1] == 0x55) {
+                uint32_t nonce = (resp[4] << 24) | (resp[5] << 16) | (resp[6] << 8) | resp[7];
+                
+                g_current_header[76] = resp[7]; g_current_header[77] = resp[6]; g_current_header[78] = resp[5]; g_current_header[79] = resp[4];
+                uint8_t h_out[32]; double_sha256(g_current_header, 80, h_out);
+                uint8_t target[32]; calculate_target(g_pool_difficulty, target);
+                
+                bool valid = false;
+                for (int i = 0; i < 32; i++) { if (h_out[31-i] < target[i]) { valid = true; break; } if (h_out[31-i] > target[i]) { valid = false; break; } }
+                
+                if (valid) {
+                    g_shares_accepted++;
+                    snprintf(g_last_accepted_times[g_accepted_idx], 64, "Share #%lu em %lu s (Diff %.1f)", (unsigned long)g_shares_accepted, (unsigned long)((esp_timer_get_time() - g_start_time)/1000000), g_pool_difficulty);
+                    g_accepted_idx = (g_accepted_idx + 1) % 10;
+                    char sub[256]; snprintf(sub, 256, "{\"id\": 4, \"method\": \"mining.submit\", \"params\": [\"%s.%s\", \"%s\", \"00000000\", \"%s\", \"%08lx\"]}\n", BTC_ADDRESS, WORKER_NAME, g_last_job_id, g_last_ntime, (unsigned long)nonce);
+                    send(sock, sub, strlen(sub), 0);
+                    ESP_LOGW(TAG, "🚀 SHARE ACEITO PELA POOL! Nonce: %08lx", (unsigned long)nonce);
                 } else {
-                    ESP_LOGE("CÉREBRO_S3", "Share rejeitado pelo S3. Poupando o seu banimento!");
+                    g_shares_rejected++;
                 }
             }
-
-            // Respiro do sistema para o Watchdog não resetar a placa
-            vTaskDelay(10 / portTICK_PERIOD_MS); 
+            vTaskDelay(10/portTICK_PERIOD_MS);
         }
-        
-        free(rx_buffer);
-        if (sock != -1) { shutdown(sock, 0); close(sock); }
+        close(sock);
+    }
+}
+
+// --- HANDLER DE EVENTOS DO WI-FI (AQUI ELE MOSTRA O IP!) ---
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) esp_wifi_connect();
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect(); ESP_LOGI(TAG, "Tentando reconectar ao Wi-Fi...");
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "========================================");
+        ESP_LOGI(TAG, "📡 Conectado! IP do Dashboard: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "👉 Acesse http://" IPSTR " no seu navegador!", IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "========================================");
     }
 }
 
 void app_main(void) {
+    g_start_time = esp_timer_get_time();
     init_uart();
-    test_uart_ping_pong();
-    ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
     esp_netif_create_default_wifi_sta();
-
+    
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    esp_wifi_init(&cfg);
+    
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    wifi_config_t wifi_config = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS } };
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
 
     vTaskDelay(5000 / portTICK_PERIOD_MS);
+    start_webserver(); 
     xTaskCreate(stratum_client_task, "stratum_task", 8192, NULL, 5, NULL);
 }

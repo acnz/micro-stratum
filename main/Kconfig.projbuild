@@ -18,4 +18,22 @@ menu "Micro-Stratum Configuration"
         help
             Seu endereço de doação ou mineração.
 
+    config POOL_URL
+        string "Pool url"
+        default "pool.nerdminer.io"
+        help
+            Endereço da pool de mineração.
+
+    config POOL_PORT
+        string "Pool port"
+        default "3333"
+        help
+            Porta da pool de mineração.
+
+    config WORKER_NAME
+        string "Worker Name"
+        default "MS-minis3"
+        help
+            Nome do worker na pool.
+
 endmenu
