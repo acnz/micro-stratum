@@ -34,10 +34,12 @@
 static const char *TAG = "MICRO_STRATUM";
 
 // --- ESTATÍSTICAS GLOBAIS ---
+uint32_t g_shares_sent = 0;
+uint32_t g_shares_disc = 0;
 uint32_t g_shares_accepted = 0;
 uint32_t g_shares_rejected = 0;
 int64_t g_start_time = 0;
-char g_last_accepted_times[10][64];
+char g_last_accepted_times[4][64];
 int g_accepted_idx = 0;
 
 double g_pool_difficulty = 1.0;
@@ -245,12 +247,12 @@ esp_err_t stats_get_handler(httpd_req_t *req)
     uint32_t uptime_sec = (uint32_t)((esp_timer_get_time() - g_start_time) / 1000000);
     double hashrate = 0;
     if (uptime_sec > 0)
-        hashrate = (double)g_shares_accepted * g_pool_difficulty * 4294967296.0 / uptime_sec;
+        hashrate = (double)g_shares_sent * g_pool_difficulty * 4294967296.0 / uptime_sec;
 
     double net_diff_t = g_network_difficulty / 1000000000000.0;
 
     char history_html[2048] = "";
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < 4; i++)
     {
         if (strlen(g_last_accepted_times[i]) > 0)
         {
@@ -277,13 +279,16 @@ esp_err_t stats_get_handler(httpd_req_t *req)
              "<div class='stat'>Loteria (Bloco): <span class='val' style='font-size:0.9em; color:#03dac6;'>1 em %.2e</span></div>"
              "<div class='stat'>Melhor Share: <span class='val' style='color:#ffeb3b;'>%.8f</span></div>"
              "<div class='stat'>Total Shares: <span class='val'>%lu</span></div>"
+             "<div class='stat'>Enviados: <span class='val' style='color:#4caf50;'>%lu</span></div>"
+             "<div class='stat'>Descartados: <span class='val' style='color:#f44336;'>%lu</span></div>"
              "<div class='stat'>Aceitos: <span class='val' style='color:#4caf50;'>%lu</span></div>"
-             "<div class='stat'>Rejeitados (Brain): <span class='val' style='color:#f44336;'>%lu</span></div>"
+             "<div class='stat'>Rejeitados: <span class='val' style='color:#f44336;'>%lu</span></div>"
              "<div class='stat'>Uptime: <span class='val'>%lu s</span></div>"
              "<h3>🕒 Últimos Shares Aceitos:</h3><ul>%s</ul>"
              "</div></body></html>",
              BTC_ADDRESS, POOL_URL, POOL_PORT, hashrate, g_pool_difficulty, net_diff_t, g_network_odds, g_best_diff,
-             (unsigned long)(g_shares_accepted + g_shares_rejected), (unsigned long)g_shares_accepted,
+             (unsigned long)(g_shares_sent + g_shares_disc), (unsigned long)g_shares_sent,
+             (unsigned long)g_shares_disc,(unsigned long)g_shares_accepted,
              (unsigned long)g_shares_rejected, (unsigned long)uptime_sec, history_html);
 
     httpd_resp_set_type(req, "text/html");
@@ -499,7 +504,18 @@ static void stratum_client_task(void *pvParameters)
                                         strcat(g_extranonce2, "00");
                                 }
                             }
+                        }// ---> ADICIONE ESTA PARTE AQUI <---
+                        else if (id && id->valueint == 4) {
+                            cJSON *err = cJSON_GetObjectItem(j, "error");
+                            if (err && !cJSON_IsNull(err)) {
+                                ESP_LOGE(TAG, "❌ A POOL REJEITOU O SHARE! Motivo: %s", rx);
+                                g_shares_rejected++;
+                            } else {
+                                ESP_LOGW(TAG, "✅ A POOL ACEITOU O SHARE! Resposta: %s", rx);
+                                g_shares_accepted++;
+                            }
                         }
+                        // ----------------------------------
                         cJSON_Delete(j);
                     }
                     int rem = rx_len - (nl - rx) - 1;
@@ -551,19 +567,19 @@ static void stratum_client_task(void *pvParameters)
 
                 if (valid)
                 {
-                    g_shares_accepted++;
-                    snprintf(g_last_accepted_times[g_accepted_idx], 64, "Share #%lu em %lu s (Diff %.5f)", (unsigned long)g_shares_accepted, (unsigned long)((esp_timer_get_time() - g_start_time) / 1000000), g_pool_difficulty);
-                    g_accepted_idx = (g_accepted_idx + 1) % 10;
+                    g_shares_sent++;
+                    snprintf(g_last_accepted_times[g_accepted_idx], 64, "Share #%lu em %lu s (Diff %.5f)", (unsigned long)g_shares_sent, (unsigned long)((esp_timer_get_time() - g_start_time) / 1000000), g_pool_difficulty);
+                    g_accepted_idx = (g_accepted_idx + 1) % 4;
 
                     // CORREÇÃO CRÍTICA: Usando o extranonce2 validado na hora de enviar!
                     char sub[256];
                     snprintf(sub, 256, "{\"id\": 4, \"method\": \"mining.submit\", \"params\": [\"%s.%s\", \"%s\", \"%s\", \"%s\", \"%08lx\"]}\n", BTC_ADDRESS, WORKER_NAME, g_last_job_id, g_extranonce2, g_last_ntime, (unsigned long)nonce);
                     send(sock, sub, strlen(sub), 0);
-                    ESP_LOGW(TAG, "🚀 SHARE ACEITO PELA POOL! Nonce: %08lx", (unsigned long)nonce);
+                    ESP_LOGW(TAG, "🚀 SHARE ACEITO, ENVIANDO PARA POOL! Nonce: %08lx", (unsigned long)nonce);
                 }
                 else
                 {
-                    g_shares_rejected++;
+                    g_shares_disc++;
                 }
             }
 
