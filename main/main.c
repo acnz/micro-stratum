@@ -506,13 +506,12 @@ static void stratum_client_task(void *pvParameters)
                             }
                         }// ---> ADICIONE ESTA PARTE AQUI <---
                         else if (id && id->valueint == 4) {
-                            cJSON *err = cJSON_GetObjectItem(j, "error");
-                            if (err && !cJSON_IsNull(err)) {
-                                ESP_LOGE(TAG, "❌ A POOL REJEITOU O SHARE! Motivo: %s", rx);
-                                g_shares_rejected++;
+                            cJSON *res = cJSON_GetObjectItem(j, "result");
+                            if (cJSON_IsTrue(res)) {
+                                ESP_LOGW(TAG, "✅ A POOL ACEITOU O SHARE DE VERDADE!");
                             } else {
-                                ESP_LOGW(TAG, "✅ A POOL ACEITOU O SHARE! Resposta: %s", rx);
-                                g_shares_accepted++;
+                                cJSON *rej = cJSON_GetObjectItem(j, "reject-reason");
+                                ESP_LOGE(TAG, "❌ A POOL REJEITOU O SHARE! Motivo: %s", rej ? rej->valuestring : rx);
                             }
                         }
                         // ----------------------------------
@@ -529,17 +528,16 @@ static void stratum_client_task(void *pvParameters)
             }
 
             uint8_t resp[32];
-            if (uart_read_bytes(UART_PORT, resp, 11, 10 / portTICK_PERIOD_MS) == 11 && resp[0] == 0xAA && resp[1] == 0x55)
-            {
+            if (uart_read_bytes(UART_PORT, resp, 11, 10 / portTICK_PERIOD_MS) == 11 && resp[0] == 0xAA && resp[1] == 0x55) {
                 uint32_t nonce = (resp[4] << 24) | (resp[5] << 16) | (resp[6] << 8) | resp[7];
-
-                g_current_header[76] = resp[7];
-                g_current_header[77] = resp[6];
-                g_current_header[78] = resp[5];
-                g_current_header[79] = resp[4];
-                uint8_t h_out[32];
-                double_sha256(g_current_header, 80, h_out);
-
+                
+                // CORREÇÃO CRÍTICA DE ENDIANNESS: Os bytes entram na ordem exata que a Bitmain cospe!
+                g_current_header[76] = resp[4]; 
+                g_current_header[77] = resp[5]; 
+                g_current_header[78] = resp[6]; 
+                g_current_header[79] = resp[7];
+                
+                uint8_t h_out[32]; double_sha256(g_current_header, 80, h_out);
                 double current_hash_diff = calculate_current_hash_diff(h_out);
                 if (current_hash_diff > g_best_diff)
                 {
