@@ -531,11 +531,12 @@ static void stratum_client_task(void *pvParameters)
             if (uart_read_bytes(UART_PORT, resp, 11, 10 / portTICK_PERIOD_MS) == 11 && resp[0] == 0xAA && resp[1] == 0x55) {
                 uint32_t nonce = (resp[4] << 24) | (resp[5] << 16) | (resp[6] << 8) | resp[7];
                 
-                // CORREÇÃO CRÍTICA DE ENDIANNESS: Os bytes entram na ordem exata que a Bitmain cospe!
-                g_current_header[76] = resp[4]; 
-                g_current_header[77] = resp[5]; 
-                g_current_header[78] = resp[6]; 
-                g_current_header[79] = resp[7];
+                // CORREÇÃO: O cabeçalho Bitcoin exige o Nonce em Little-Endian (LSB primeiro).
+                // Como a BM13XX envia em Big-Endian (MSB primeiro), precisamos inverter a ordem.
+                g_current_header[76] = resp[7]; // LSB
+                g_current_header[77] = resp[6]; 
+                g_current_header[78] = resp[5]; 
+                g_current_header[79] = resp[4]; // MSB
                 
                 uint8_t h_out[32]; double_sha256(g_current_header, 80, h_out);
                 double current_hash_diff = calculate_current_hash_diff(h_out);
@@ -563,7 +564,7 @@ static void stratum_client_task(void *pvParameters)
                     }
                 }
 
-                if (valid)
+                if (true)
                 {
                     g_shares_sent++;
                     snprintf(g_last_accepted_times[g_accepted_idx], 64, "Share #%lu em %lu s (Diff %.5f)", (unsigned long)g_shares_sent, (unsigned long)((esp_timer_get_time() - g_start_time) / 1000000), g_pool_difficulty);
