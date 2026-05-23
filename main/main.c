@@ -317,6 +317,7 @@ void process_mining_notify(cJSON *params)
     if (!params || !cJSON_IsArray(params) || cJSON_GetArraySize(params) < 8)
         return;
 
+        
     cJSON *j_job = cJSON_GetArrayItem(params, 0);
     cJSON *j_prev = cJSON_GetArrayItem(params, 1);
     cJSON *j_cb1 = cJSON_GetArrayItem(params, 2);
@@ -404,6 +405,8 @@ void process_mining_notify(cJSON *params)
         packet[69] = get_crc5(&packet[2], 67);
         uart_write_bytes(UART_PORT, packet, 70);
         ESP_LOGI(TAG, "=> Trabalho ID [%s] enviado para o ASIC fritar!", g_last_job_id);
+        ESP_LOGW(TAG, "[header]");
+        ESP_LOG_BUFFER_HEX(TAG, header, sizeof(header));
     }
 }
 
@@ -564,7 +567,7 @@ static void stratum_client_task(void *pvParameters)
                     }
                 }
 
-                if (true)
+                if (valid)
                 {
                     g_shares_sent++;
                     snprintf(g_last_accepted_times[g_accepted_idx], 64, "Share #%lu em %lu s (Diff %.5f)", (unsigned long)g_shares_sent, (unsigned long)((esp_timer_get_time() - g_start_time) / 1000000), g_pool_difficulty);
