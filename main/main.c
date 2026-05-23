@@ -34,6 +34,7 @@
 static const char *TAG = "MICRO_STRATUM";
 
 // --- ESTATÍSTICAS GLOBAIS ---
+bool verbose = false;
 uint32_t g_shares_sent = 0;
 uint32_t g_shares_disc = 0;
 uint32_t g_shares_accepted = 0;
@@ -246,8 +247,18 @@ esp_err_t stats_get_handler(httpd_req_t *req)
 
     uint32_t uptime_sec = (uint32_t)((esp_timer_get_time() - g_start_time) / 1000000);
     double hashrate = 0;
-    if (uptime_sec > 0)
-        hashrate = (double)g_shares_sent * g_pool_difficulty * 4294967296.0 / uptime_sec;
+
+    // Defina a dificuldade real do filtro da sua FPGA aqui:
+    // 1 Byte de zero  = 1.0 / 16777216.0
+    // 2 Bytes de zero = 1.0 / 65536.0
+    // 3 Bytes de zero = 1.0 / 256.0      (O seu atual)
+    // 4 Bytes de zero = 1.0
+    double hardware_difficulty = 1.0 / 256.0; 
+
+    if (uptime_sec > 0) {
+        // Usamos (g_shares_sent + g_shares_disc) para contar TODO o trabalho bruto que a FPGA cuspiu
+        hashrate = (double)(g_shares_sent + g_shares_disc) * hardware_difficulty * 4294967296.0 / uptime_sec;
+    }
 
     double net_diff_t = g_network_difficulty / 1000000000000.0;
 
@@ -316,6 +327,7 @@ void process_mining_notify(cJSON *params)
 {
     if (!params || !cJSON_IsArray(params) || cJSON_GetArraySize(params) < 8)
         return;
+    if(verbose){
 // ========================================================================
     // LOG DE DEPURAÇÃO: IMPRIMIR DADOS BRUTOS DA POOL
     // ========================================================================
@@ -350,7 +362,7 @@ void process_mining_notify(cJSON *params)
     }
     ESP_LOGI(TAG, "----------------------------------");
     // ========================================================================
-        
+}
     cJSON *j_job = cJSON_GetArrayItem(params, 0);
     cJSON *j_prev = cJSON_GetArrayItem(params, 1);
     cJSON *j_cb1 = cJSON_GetArrayItem(params, 2);
@@ -437,9 +449,10 @@ void process_mining_notify(cJSON *params)
         memcpy(&packet[36], &header[64], 12);
         packet[69] = get_crc5(&packet[2], 67);
         uart_write_bytes(UART_PORT, packet, 70);
+        if(verbose){
         ESP_LOGI(TAG, "=> Trabalho ID [%s] enviado para o ASIC fritar!", g_last_job_id);
         ESP_LOGW(TAG, "[header]");
-        ESP_LOG_BUFFER_HEX(TAG, header, sizeof(header));
+        ESP_LOG_BUFFER_HEX(TAG, header, sizeof(header));}
     }
 }
 
@@ -614,10 +627,12 @@ static void stratum_client_task(void *pvParameters)
 
                     // CORREÇÃO CRÍTICA: Usando o extranonce2 validado na hora de enviar!
                     char sub[256];
-                    snprintf(sub, 256, "{\"id\": 4, \"method\": \"mining.submit\", \"params\": [\"%s.%s\", \"%s\", \"%s\", \"%s\", \"%08lx\"]}\n", BTC_ADDRESS, WORKER_NAME, g_last_job_id, g_extranonce2, g_last_ntime, (unsigned long)nonce);
-                    send(sock, sub, strlen(sub), 0);
-                    ESP_LOGW(TAG, "🚀 SHARE ACEITO, ENVIANDO PARA POOL! Nonce: %08lx", (unsigned long)nonce);
-                }
+                        // CORREÇÃO: Passamos a variável 'nonce' original diretamente, sem nenhuma inversão!
+                        snprintf(sub, 256, "{\"id\": 4, \"method\": \"mining.submit\", \"params\": [\"%s.%s\", \"%s\", \"%s\", \"%s\", \"%08lx\"]}\n", BTC_ADDRESS, WORKER_NAME, g_last_job_id, g_extranonce2, g_last_ntime, (unsigned long)nonce);
+                        send(sock, sub, strlen(sub), 0);
+                        
+                        ESP_LOGW(TAG, "🚀 SHARE ACEITO, ENVIANDO PARA POOL! Nonce: %08lx", (unsigned long)nonce);
+                    }
                 else
                 {
                     g_shares_disc++;
