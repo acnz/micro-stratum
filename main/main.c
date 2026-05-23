@@ -316,7 +316,40 @@ void process_mining_notify(cJSON *params)
 {
     if (!params || !cJSON_IsArray(params) || cJSON_GetArraySize(params) < 8)
         return;
+// ========================================================================
+    // LOG DE DEPURAÇÃO: IMPRIMIR DADOS BRUTOS DA POOL
+    // ========================================================================
+    char *json_str = cJSON_Print(params); // Converte o JSON em string formatada
+    if (json_str) {
+        ESP_LOGW(TAG, "======= [STRATUM RECEBIDO] PARAMETROS DO MINING.NOTIFY =======");
+        printf("%s\n", json_str); // printf puro para não estourar o limite de tamanho do ESP_LOG
+        ESP_LOGW(TAG, "=============================================================");
+        free(json_str); // IMPORTANTE: cJSON_Print aloca RAM, precisamos liberar!
+    }
 
+    // Se preferir ver de forma isolada campo por campo limpo em String:
+    cJSON *j_test_job   = cJSON_GetArrayItem(params, 0);
+    cJSON *j_test_prev  = cJSON_GetArrayItem(params, 1);
+    cJSON *j_test_cb1   = cJSON_GetArrayItem(params, 2);
+    cJSON *j_test_cb2   = cJSON_GetArrayItem(params, 3);
+    cJSON *j_test_merkle= cJSON_GetArrayItem(params, 4);
+    cJSON *j_test_ver   = cJSON_GetArrayItem(params, 5);
+    cJSON *j_test_nbits = cJSON_GetArrayItem(params, 6);
+    cJSON *j_test_ntime = cJSON_GetArrayItem(params, 7);
+
+    ESP_LOGI(TAG, "--- CAMPOS SEPARADOS EM STRING ---");
+    ESP_LOGI(TAG, "Job ID:    %s", j_test_job   ? j_test_job->valuestring : "NULL");
+    ESP_LOGI(TAG, "Prev Hash: %s", j_test_prev  ? j_test_prev->valuestring : "NULL");
+    ESP_LOGI(TAG, "Coinbase1: %s", j_test_cb1   ? j_test_cb1->valuestring : "NULL");
+    ESP_LOGI(TAG, "Coinbase2: %s", j_test_cb2   ? j_test_cb2->valuestring : "NULL");
+    ESP_LOGI(TAG, "Version:   %s", j_test_ver   ? j_test_ver->valuestring : "NULL");
+    ESP_LOGI(TAG, "Bits:      %s", j_test_nbits ? j_test_nbits->valuestring : "NULL");
+    ESP_LOGI(TAG, "Time:      %s", j_test_ntime ? j_test_ntime->valuestring : "NULL");
+    if (j_test_merkle && cJSON_IsArray(j_test_merkle)) {
+        ESP_LOGI(TAG, "Merkle Branches Count: %d", cJSON_GetArraySize(j_test_merkle));
+    }
+    ESP_LOGI(TAG, "----------------------------------");
+    // ========================================================================
         
     cJSON *j_job = cJSON_GetArrayItem(params, 0);
     cJSON *j_prev = cJSON_GetArrayItem(params, 1);
@@ -536,10 +569,16 @@ static void stratum_client_task(void *pvParameters)
                 
                 // CORREÇÃO: O cabeçalho Bitcoin exige o Nonce em Little-Endian (LSB primeiro).
                 // Como a BM13XX envia em Big-Endian (MSB primeiro), precisamos inverter a ordem.
-                g_current_header[76] = resp[7]; // LSB
-                g_current_header[77] = resp[6]; 
-                g_current_header[78] = resp[5]; 
-                g_current_header[79] = resp[4]; // MSB
+                //g_current_header[76] = resp[7]; // LSB
+                //g_current_header[77] = resp[6]; 
+                //g_current_header[78] = resp[5]; 
+                //g_current_header[79] = resp[4]; // MSB
+
+                // Mude para a ordem direta (Big-Endian no buffer linear do cabeçalho)
+                g_current_header[76] = resp[4]; 
+                g_current_header[77] = resp[5]; 
+                g_current_header[78] = resp[6]; 
+                g_current_header[79] = resp[7];
                 
                 uint8_t h_out[32]; double_sha256(g_current_header, 80, h_out);
                 double current_hash_diff = calculate_current_hash_diff(h_out);
