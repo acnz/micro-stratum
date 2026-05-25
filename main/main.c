@@ -163,6 +163,27 @@ void hex_to_bytes(const char *hex, uint8_t *bytes)
     }
 }
 
+// Converte strings Hex de 4 bytes (como Version, NTime, NBits) para Little-Endian
+void hex_to_le_bytes(const char *hex, uint8_t *bytes) {
+    uint8_t temp[4];
+    hex_to_bytes(hex, temp);
+    bytes[0] = temp[3];
+    bytes[1] = temp[2];
+    bytes[2] = temp[1];
+    bytes[3] = temp[0];
+}
+
+// Faz o Word-Swap necessário para o Previous Block Hash do Stratum
+void swap_endian_words(const char *hex_words, uint8_t *output) {
+    size_t binary_length = strlen(hex_words) / 2;
+    for (size_t i = 0; i < binary_length; i += 4) {
+        for (int j = 0; j < 4; j++) {
+            char byte_str[3] = {hex_words[(i + j) * 2], hex_words[(i + j) * 2 + 1], 0};
+            output[i + (3 - j)] = (uint8_t)strtol(byte_str, NULL, 16);
+        }
+    }
+}
+
 void double_sha256(const uint8_t *data, size_t len, uint8_t *out)
 {
     uint8_t h1[32];
@@ -432,11 +453,19 @@ void process_mining_notify(cJSON *params)
             }
         }
 
-        hex_to_bytes(j_ver->valuestring, &header[0]);
-        hex_to_bytes(j_prev->valuestring, &header[4]);
-        memcpy(&header[36], current_hash, 32);
-        hex_to_bytes(j_ntime->valuestring, &header[68]);
-        hex_to_bytes(j_nbits->valuestring, &header[72]);
+// ----------------------------------------------------
+        // CORREÇÃO: Usando as funções de Endianness adequadas!
+        // ----------------------------------------------------
+        hex_to_le_bytes(j_ver->valuestring, &header[0]);
+        
+        swap_endian_words(j_prev->valuestring, &header[4]); // Prev Hash exige Word-Swap
+        
+        memcpy(&header[36], current_hash, 32); // Merkle root (Correto, não mexe)
+        
+        hex_to_le_bytes(j_ntime->valuestring, &header[68]);
+        
+        hex_to_le_bytes(j_nbits->valuestring, &header[72]);
+        // ----------------------------------------------------
 
         memcpy(g_current_header, header, 80);
         strncpy(g_last_job_id, j_job->valuestring, 31);
@@ -626,9 +655,14 @@ static void stratum_client_task(void *pvParameters)
                     g_accepted_idx = (g_accepted_idx + 1) % 4;
 
                     // CORREÇÃO CRÍTICA: Usando o extranonce2 validado na hora de enviar!
+// CORREÇÃO DA POOL: Inverte os 4 bytes do nonce para o formato Stratum
+    uint32_t pool_nonce = ((nonce & 0xFF000000) >> 24) |
+                          ((nonce & 0x00FF0000) >> 8)  |
+                          ((nonce & 0x0000FF00) << 8)  |
+                          ((nonce & 0x000000FF) << 24);
                     char sub[256];
                         // CORREÇÃO: Passamos a variável 'nonce' original diretamente, sem nenhuma inversão!
-                        snprintf(sub, 256, "{\"id\": 4, \"method\": \"mining.submit\", \"params\": [\"%s.%s\", \"%s\", \"%s\", \"%s\", \"%08lx\"]}\n", BTC_ADDRESS, WORKER_NAME, g_last_job_id, g_extranonce2, g_last_ntime, (unsigned long)nonce);
+                        snprintf(sub, 256, "{\"id\": 4, \"method\": \"mining.submit\", \"params\": [\"%s.%s\", \"%s\", \"%s\", \"%s\", \"%08lx\"]}\n", BTC_ADDRESS, WORKER_NAME, g_last_job_id, g_extranonce2, g_last_ntime, (unsigned long)pool_nonce);
                         send(sock, sub, strlen(sub), 0);
                         
                         ESP_LOGW(TAG, "🚀 SHARE ACEITO, ENVIANDO PARA POOL! Nonce: %08lx", (unsigned long)nonce);
