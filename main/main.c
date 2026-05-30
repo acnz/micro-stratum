@@ -34,7 +34,7 @@
 static const char *TAG = "MICRO_STRATUM";
 
 // --- ESTATÍSTICAS GLOBAIS ---
-bool verbose = false;
+bool verbose = true;
 uint32_t g_shares_sent = 0;
 uint32_t g_shares_disc = 0;
 uint32_t g_shares_accepted = 0;
@@ -586,8 +586,10 @@ static void stratum_client_task(void *pvParameters)
                         else if (id && id->valueint == 4) {
                             cJSON *res = cJSON_GetObjectItem(j, "result");
                             if (cJSON_IsTrue(res)) {
+                                g_shares_accepted++;
                                 ESP_LOGW(TAG, "✅ A POOL ACEITOU O SHARE DE VERDADE!");
                             } else {
+                                g_shares_rejected++;
                                 cJSON *rej = cJSON_GetObjectItem(j, "reject-reason");
                                 ESP_LOGE(TAG, "❌ A POOL REJEITOU O SHARE! Motivo: %s", rej ? rej->valuestring : rx);
                             }
@@ -706,10 +708,48 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 }
 
+void asic_handshake() {
+    // O mesmo comando INIT3 que extraímos do código do Bitaxe
+    uint8_t init3[7] = {0x55, 0xAA, 0x52, 0x05, 0x00, 0x00, 0x0A};
+    uint8_t rx_buf[64];
+    bool asic_found = false;
+    
+    ESP_LOGW(TAG, "Procurando ASIC BM13XX...");
+    
+    while (!asic_found) {
+        // Envia a pergunta
+        uart_write_bytes(UART_PORT, init3, 7);
+        
+        // Espera a resposta da Bridge/FPGA
+        int len = uart_read_bytes(UART_PORT, rx_buf, sizeof(rx_buf), 1000 / portTICK_PERIOD_MS);
+        
+        if (len >= 11 && rx_buf[0] == 0x55 && rx_buf[1] == 0xAA) {
+            if (rx_buf[2] == 0x13 && rx_buf[3] == 0x66) { // Chip ID = 1366
+                ESP_LOGW(TAG, "✅ Chip BM1366 detectado! CORE_NUM: 0x%02x ADDR: 0x%02x", rx_buf[4], rx_buf[5]);
+                // Validação do seu CRC dinâmico do FPGA
+                if (get_crc5(&rx_buf[2], 8) == rx_buf[10]) {
+                    ESP_LOGW(TAG, "✅ CRC5 Validado com sucesso!");
+                    asic_found = true;
+                } else {
+                    ESP_LOGE(TAG, "❌ CRC5 Inválido! Recebido: %02x, Calculado: %02x", rx_buf[10], get_crc5(&rx_buf[2], 8));
+                }
+            }
+        }
+        
+        if (!asic_found) {
+            ESP_LOGE(TAG, "Nenhum ASIC respondeu. Tentando novamente em 2s...");
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+        }
+    }
+}
+
 void app_main(void)
 {
     g_start_time = esp_timer_get_time();
     init_uart();
+
+    asic_handshake();
+
     nvs_flash_init();
     esp_netif_init();
     esp_event_loop_create_default();
