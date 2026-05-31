@@ -30,6 +30,8 @@
 #define POOL_URL CONFIG_POOL_URL
 #define POOL_PORT CONFIG_POOL_PORT
 #define WORKER_NAME CONFIG_WORKER_NAME
+#define DEVICE_NAME CONFIG_DEVICE_NAME
+#define DEVICE_VER CONFIG_DEVICE_VER
 
 static const char *TAG = "MICRO_STRATUM";
 
@@ -341,6 +343,20 @@ void start_webserver()
     }
 }
 
+/**
+ * @brief Inverte a ordem dos BYTES dentro de cada palavra de 32 bits.
+ * Mantém a ordem das palavras intacta.
+ */
+void swap_bytes_in_32bit_words(const uint8_t *src, uint8_t *dst, size_t num_bytes) {
+    size_t num_words = num_bytes / 4;
+    for (size_t i = 0; i < num_words; i++) {
+        dst[i * 4 + 0] = src[i * 4 + 3]; // O último byte da palavra vira o primeiro
+        dst[i * 4 + 1] = src[i * 4 + 2];
+        dst[i * 4 + 2] = src[i * 4 + 1];
+        dst[i * 4 + 3] = src[i * 4 + 0]; // O primeiro byte vira o último
+    }
+}
+
 // ============================================================================
 // STRATUM PARSER & CLIENT
 // ============================================================================
@@ -453,7 +469,7 @@ void process_mining_notify(cJSON *params)
             }
         }
 
-// ----------------------------------------------------
+        // ----------------------------------------------------
         // CORREÇÃO: Usando as funções de Endianness adequadas!
         // ----------------------------------------------------
         hex_to_le_bytes(j_ver->valuestring, &header[0]);
@@ -474,14 +490,33 @@ void process_mining_notify(cJSON *params)
         uint8_t midstate[32] = {0};
         calculate_midstate(header, midstate);
         uint8_t packet[70] = {0x55, 0xAA, 0x21, 0x42};
+
+        uint8_t o_data_bytes[12];
+        uint8_t temp_data_bytes[12];
+        // Executa a inversão do data
+        memcpy(o_data_bytes, &header[64], 12);
+        swap_bytes_in_32bit_words(o_data_bytes, temp_data_bytes, sizeof(o_data_bytes));
+
+        uint8_t temp_midstate_bytes[32];
+        // Executa a inversão do Midstate
+        swap_bytes_in_32bit_words(midstate, temp_midstate_bytes, sizeof(midstate));
+
         memcpy(&packet[4], midstate, 32);
-        memcpy(&packet[36], &header[64], 12);
+        memcpy(&packet[36], o_data_bytes, 12);
         packet[69] = get_crc5(&packet[2], 67);
         uart_write_bytes(UART_PORT, packet, 70);
         if(verbose){
         ESP_LOGI(TAG, "=> Trabalho ID [%s] enviado para o ASIC fritar!", g_last_job_id);
         ESP_LOGW(TAG, "[header]");
-        ESP_LOG_BUFFER_HEX(TAG, header, sizeof(header));}
+        ESP_LOG_BUFFER_HEX(TAG, header, sizeof(header));
+        ESP_LOGW(TAG, "[data]");
+        ESP_LOG_BUFFER_HEX(TAG, o_data_bytes, sizeof(o_data_bytes));
+        ESP_LOGW(TAG, "[FPGAdata]");
+        ESP_LOG_BUFFER_HEX(TAG, temp_data_bytes, sizeof(temp_data_bytes));
+        ESP_LOGW(TAG, "[midstate]");
+        ESP_LOG_BUFFER_HEX(TAG, midstate, sizeof(midstate));
+        ESP_LOGW(TAG, "[FPGAmidstate]");
+        ESP_LOG_BUFFER_HEX(TAG, temp_midstate_bytes, sizeof(temp_midstate_bytes));}
     }
 }
 
@@ -514,7 +549,8 @@ static void stratum_client_task(void *pvParameters)
             continue;
         }
 
-        const char *sub_msg = "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"MicroStratum/1.0\"]}\n";
+        char sub_msg[256];
+        snprintf(sub_msg, 256, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"%s/%s\"]}\n", CONFIG_DEVICE_NAME, CONFIG_DEVICE_VER);
         send(sock, sub_msg, strlen(sub_msg), 0);
 
         char auth[256];
@@ -609,7 +645,6 @@ static void stratum_client_task(void *pvParameters)
 
             uint8_t resp[32];
             if (uart_read_bytes(UART_PORT, resp, 11, 10 / portTICK_PERIOD_MS) == 11 && resp[0] == 0xAA && resp[1] == 0x55) {
-                uint32_t nonce = (resp[4] << 24) | (resp[5] << 16) | (resp[6] << 8) | resp[7];
                 
                 // CORREÇÃO: O cabeçalho Bitcoin exige o Nonce em Little-Endian (LSB primeiro).
                 // Como a BM13XX envia em Big-Endian (MSB primeiro), precisamos inverter a ordem.
@@ -623,7 +658,13 @@ static void stratum_client_task(void *pvParameters)
                 g_current_header[77] = resp[5]; 
                 g_current_header[78] = resp[6]; 
                 g_current_header[79] = resp[7];
-                
+
+                uint32_t nonce = (g_current_header[76] << 24) | (g_current_header[77] << 16) | (g_current_header[78] << 8) | g_current_header[79];
+
+                if(verbose){
+                ESP_LOGW(TAG, "Nonce recebido: %08lx", (unsigned long)nonce);
+                }
+
                 uint8_t h_out[32]; double_sha256(g_current_header, 80, h_out);
                 double current_hash_diff = calculate_current_hash_diff(h_out);
                 if (current_hash_diff > g_best_diff)

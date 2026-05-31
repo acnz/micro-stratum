@@ -32,7 +32,19 @@ menu "Micro-Stratum Configuration"
 
     config WORKER_NAME
         string "Worker Name"
-        default "MS-minis3"
+        default "Bitaxe SE"
+        help
+            Nome do worker na pool.
+    
+    config DEVICE_NAME
+        string "Device Name"
+        default "µStratum"
+        help
+            Nome do worker na pool.
+
+    config DEVICE_VER
+        string "Device version"
+        default "2.0"
         help
             Nome do worker na pool.
 
@@ -46,14 +58,14 @@ menu "Micro-Stratum Configuration"
 
     config UART_RXD
         int "UART RXD pin number"
-        default 5
+        default 18
         help
             GPIO number for UART RX pin. See UART documentation for more information
             about available pin numbers for UART.
 
     config UART_TXD
         int "UART TXD pin number"
-        default 4
+        default 17
         help
             GPIO number for UART TX pin. See UART documentation for more information
             about available pin numbers for UART.
