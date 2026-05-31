@@ -15,6 +15,7 @@
 #include "cJSON.h"
 #include "mbedtls/sha256.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "mbedtls/bignum.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
@@ -32,6 +33,7 @@
 #define WORKER_NAME CONFIG_WORKER_NAME
 #define DEVICE_NAME CONFIG_DEVICE_NAME
 #define DEVICE_VER CONFIG_DEVICE_VER
+#define RESET_PIN CONFIG_RESET_PIN
 
 static const char *TAG = "MICRO_STRATUM";
 
@@ -756,8 +758,17 @@ void asic_handshake() {
     bool asic_found = false;
     
     ESP_LOGW(TAG, "Procurando ASIC BM13XX...");
-    
+   
     while (!asic_found) {
+        
+        ESP_LOGW(TAG, "Enviando comando elétrico de Reset para o FPGA...");
+        // 1. Puxa para nível BAIXO (0) -> Força o FPGA a entrar em Reset
+        gpio_set_level(RESET_PIN, 0);
+        vTaskDelay(100 / portTICK_PERIOD_MS); // Segura o Reset por 100ms para limpar as memórias
+
+        // 2. Puxa para nível ALTO (1) -> Libera o FPGA para rodar livremente
+        gpio_set_level(RESET_PIN, 1);
+        vTaskDelay(50 / portTICK_PERIOD_MS);  // Aguarda 50ms para as redes de clock estabilizarem
         // Envia a pergunta
         uart_write_bytes(UART_PORT, init3, 7);
         
@@ -788,6 +799,9 @@ void app_main(void)
 {
     g_start_time = esp_timer_get_time();
     init_uart();
+
+    gpio_reset_pin(RESET_PIN);
+    gpio_set_direction(RESET_PIN, GPIO_MODE_OUTPUT);
 
     asic_handshake();
 

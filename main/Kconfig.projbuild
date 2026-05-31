@@ -69,5 +69,11 @@ menu "Micro-Stratum Configuration"
         help
             GPIO number for UART TX pin. See UART documentation for more information
             about available pin numbers for UART.
+    
+    config RESET_PIN
+        int "RESET pin number"
+        default 1
+        help
+            GPIO number for RESET pin.
 
 endmenu
